@@ -6,24 +6,61 @@ This server implements the GStreamer WebRTC signaling protocol for:
 - Client (consumer): Views the stream
 - Command relay: Bidirectional commands between robot and client
 - Media relay: Fallback when P2P fails
+
+Authentication: Requires valid HuggingFace token passed as query parameter.
 """
 
 import asyncio
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, status
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Reachy Mini Central")
+
+# Cache for validated tokens (token -> username)
+token_cache: dict[str, str] = {}
+
+
+async def validate_hf_token(token: str) -> Optional[str]:
+    """Validate HuggingFace token and return username if valid."""
+    if not token:
+        return None
+
+    # Check cache first
+    if token in token_cache:
+        return token_cache[token]
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://huggingface.co/api/whoami-v2",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                username = data.get("name", "unknown")
+                token_cache[token] = username
+                logger.info(f"Token validated for user: {username}")
+                return username
+            else:
+                logger.warning(f"Token validation failed: {response.status_code}")
+                return None
+    except Exception as e:
+        logger.error(f"Error validating token: {e}")
+        return None
 
 
 class PeerRole(Enum):
@@ -37,6 +74,7 @@ class Peer:
     """Represents a connected peer (robot or client)."""
     peer_id: str
     websocket: WebSocket
+    username: str  # HuggingFace username
     role: Optional[PeerRole] = None
     meta: dict = field(default_factory=dict)
     session_id: Optional[str] = None
@@ -51,10 +89,10 @@ class SignalingServer:
         self.sessions: dict[str, tuple[str, str]] = {}  # session_id -> (producer_id, consumer_id)
         self.producers: dict[str, Peer] = {}  # producer_id -> Peer
 
-    async def register_peer(self, websocket: WebSocket) -> Peer:
+    async def register_peer(self, websocket: WebSocket, username: str) -> Peer:
         """Register a new peer and send welcome message."""
         peer_id = str(uuid.uuid4())
-        peer = Peer(peer_id=peer_id, websocket=websocket)
+        peer = Peer(peer_id=peer_id, websocket=websocket, username=username)
         self.peers[peer_id] = peer
 
         # Send welcome message (GStreamer protocol)
@@ -63,7 +101,7 @@ class SignalingServer:
             "peerId": peer_id
         })
 
-        logger.info(f"Peer registered: {peer_id}")
+        logger.info(f"Peer registered: {peer_id} (user: {username})")
         return peer
 
     async def unregister_peer(self, peer: Peer):
@@ -283,10 +321,16 @@ signaling = SignalingServer()
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """Main WebSocket endpoint for signaling."""
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
+    """Main WebSocket endpoint for signaling. Requires HF token."""
+    # Validate token
+    username = await validate_hf_token(token)
+    if not username:
+        await websocket.close(code=4001, reason="Invalid or missing HuggingFace token")
+        return
+
     await websocket.accept()
-    peer = await signaling.register_peer(websocket)
+    peer = await signaling.register_peer(websocket, username)
 
     try:
         while True:
@@ -312,6 +356,7 @@ async def root():
             body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
             .status {{ padding: 10px; background: #e8f5e9; border-radius: 5px; }}
             code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
+            .auth {{ padding: 10px; background: #fff3e0; border-radius: 5px; margin-top: 10px; }}
         </style>
     </head>
     <body>
@@ -322,8 +367,11 @@ async def root():
             <p><strong>Active Producers:</strong> {len(signaling.producers)}</p>
             <p><strong>Active Sessions:</strong> {len(signaling.sessions)}</p>
         </div>
+        <div class="auth">
+            <p><strong>Authentication:</strong> HuggingFace token required</p>
+        </div>
         <h2>WebSocket Endpoint</h2>
-        <p>Connect to: <code>wss://{{host}}/ws</code></p>
+        <p>Connect to: <code>wss://host/ws?token=YOUR_HF_TOKEN</code></p>
         <h2>Protocol</h2>
         <p>This server implements the GStreamer WebRTC signaling protocol.</p>
     </body>
@@ -343,8 +391,12 @@ async def health():
 
 
 @app.get("/api/producers")
-async def list_producers():
-    """List all registered producers."""
+async def list_producers(token: str = Query(default="")):
+    """List all registered producers. Requires HF token."""
+    username = await validate_hf_token(token)
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
     return {
         "producers": [
             {"peerId": p.peer_id, "meta": p.meta}
