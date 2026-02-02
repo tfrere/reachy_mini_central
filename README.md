@@ -12,7 +12,7 @@ hf_oauth_expiration_minutes: 480
 
 # Reachy Mini Central
 
-WebRTC signaling server for Reachy Mini baby camera.
+WebRTC signaling server for Reachy Mini robot.
 
 ## Features
 
