@@ -322,11 +322,29 @@ signaling = SignalingServer()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
-    """Main WebSocket endpoint for signaling. Requires HF token."""
-    # Validate token
-    username = await validate_hf_token(token)
+    """Main WebSocket endpoint for signaling.
+
+    Authentication methods (in order of priority):
+    1. HF proxy headers (for logged-in browser users accessing the Space)
+    2. Token query parameter (for robots/external clients)
+    """
+    username = None
+
+    # Method 1: Check HF proxy headers (set by HuggingFace when user is logged in)
+    # HF adds these headers when authenticated users access a Space
+    hf_user = websocket.headers.get("HF-User") or websocket.headers.get("x-hf-user")
+    if hf_user:
+        username = hf_user
+        logger.info(f"Authenticated via HF proxy: {username}")
+
+    # Method 2: Validate token from query parameter
+    if not username and token:
+        username = await validate_hf_token(token)
+        if username:
+            logger.info(f"Authenticated via token: {username}")
+
     if not username:
-        await websocket.close(code=4001, reason="Invalid or missing HuggingFace token")
+        await websocket.close(code=4001, reason="Authentication required - please log in to HuggingFace or provide a token")
         return
 
     await websocket.accept()
