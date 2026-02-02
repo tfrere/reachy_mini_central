@@ -1,28 +1,25 @@
 """
 Reachy Mini Central - WebRTC Signaling Server
 
-This server implements the GStreamer WebRTC signaling protocol for:
-- Robot (producer): Streams video/audio
-- Client (consumer): Views the stream
-- Command relay: Bidirectional commands between robot and client
-- Media relay: Fallback when P2P fails
+This server implements the GStreamer WebRTC signaling protocol using:
+- SSE (Server-Sent Events) for server-to-client messages
+- HTTP POST for client-to-server messages
 
-Authentication: Requires valid HuggingFace token passed as query parameter.
+This works reliably through HTTP/2 proxies like HuggingFace Spaces.
 """
 
 import asyncio
 import json
 import logging
-import os
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from sse_starlette.sse import EventSourceResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,123 +70,89 @@ async def validate_hf_token(token: str) -> Optional[str]:
         return None
 
 
-class PeerRole(Enum):
-    PRODUCER = "producer"
-    CONSUMER = "consumer"
-    LISTENER = "listener"
-
-
 @dataclass
 class Peer:
     """Represents a connected peer (robot or client)."""
     peer_id: str
-    websocket: WebSocket
-    username: str  # HuggingFace username
-    role: Optional[PeerRole] = None
+    username: str
+    role: Optional[str] = None
     meta: dict = field(default_factory=dict)
+    message_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    connected: bool = True
     session_id: Optional[str] = None
-    partner_id: Optional[str] = None  # Connected peer for session
+    partner_id: Optional[str] = None
 
 
 class SignalingServer:
-    """GStreamer-compatible WebRTC signaling server."""
+    """HTTP-based WebRTC signaling server."""
 
     def __init__(self):
         self.peers: dict[str, Peer] = {}
         self.sessions: dict[str, tuple[str, str]] = {}  # session_id -> (producer_id, consumer_id)
         self.producers: dict[str, Peer] = {}  # producer_id -> Peer
+        # Token to peer_id mapping for reconnection
+        self.token_to_peer: dict[str, str] = {}
 
-    async def register_peer(self, websocket: WebSocket, username: str) -> Peer:
-        """Register a new peer and send welcome message."""
+    def get_or_create_peer(self, token: str, username: str) -> Peer:
+        """Get existing peer or create new one."""
+        # Check if this token already has a peer
+        if token in self.token_to_peer:
+            peer_id = self.token_to_peer[token]
+            if peer_id in self.peers:
+                peer = self.peers[peer_id]
+                peer.connected = True
+                logger.info(f"Peer reconnected: {peer_id}")
+                return peer
+
+        # Create new peer
         peer_id = str(uuid.uuid4())
-        peer = Peer(peer_id=peer_id, websocket=websocket, username=username)
+        peer = Peer(peer_id=peer_id, username=username)
         self.peers[peer_id] = peer
-
-        # Send welcome message (GStreamer protocol)
-        await self.send_message(peer, {
-            "type": "welcome",
-            "peerId": peer_id
-        })
-
-        logger.info(f"Peer registered: {peer_id} (user: {username})")
+        self.token_to_peer[token] = peer_id
+        logger.info(f"New peer created: {peer_id} for user {username}")
         return peer
 
-    async def unregister_peer(self, peer: Peer):
-        """Clean up when peer disconnects."""
-        peer_id = peer.peer_id
-
-        # Clean up sessions
-        if peer.session_id:
-            await self.end_session(peer.session_id)
-
-        # Remove from producers
-        if peer_id in self.producers:
-            del self.producers[peer_id]
-            # Notify listeners that producer left
-            await self.broadcast_peer_status(peer_id, None, removed=True)
-
-        # Remove peer
+    async def send_to_peer(self, peer_id: str, message: dict):
+        """Queue a message for a peer."""
         if peer_id in self.peers:
-            del self.peers[peer_id]
+            await self.peers[peer_id].message_queue.put(message)
 
-        logger.info(f"Peer unregistered: {peer_id}")
+    async def broadcast_to_listeners(self, message: dict, exclude_id: str = None):
+        """Send message to all connected peers except the sender."""
+        for peer_id, peer in self.peers.items():
+            if peer_id != exclude_id and peer.connected:
+                await peer.message_queue.put(message)
 
-    async def send_message(self, peer: Peer, message: dict):
-        """Send JSON message to peer."""
-        try:
-            await peer.websocket.send_text(json.dumps(message))
-        except Exception as e:
-            logger.error(f"Failed to send to {peer.peer_id}: {e}")
-
-    async def broadcast_peer_status(self, peer_id: str, meta: Optional[dict], removed: bool = False):
-        """Broadcast producer status to all listeners/consumers."""
-        message = {
-            "type": "peerStatusChanged",
-            "peerId": peer_id,
-            "roles": [] if removed else ["producer"],
-            "meta": meta or {}
-        }
-
-        for p in self.peers.values():
-            if p.peer_id != peer_id:
-                await self.send_message(p, message)
-
-    async def handle_set_peer_status(self, peer: Peer, message: dict):
-        """Handle producer registration."""
+    def handle_set_peer_status(self, peer: Peer, message: dict):
+        """Handle peer status update (producer/listener registration)."""
         roles = message.get("roles", [])
         meta = message.get("meta", {})
-
         peer.meta = meta
 
         if "producer" in roles:
-            peer.role = PeerRole.PRODUCER
+            peer.role = "producer"
             self.producers[peer.peer_id] = peer
             logger.info(f"Producer registered: {peer.peer_id} with meta: {meta}")
-
-            # Broadcast to all connected peers
-            await self.broadcast_peer_status(peer.peer_id, meta)
-
+            return {"type": "peerStatusChanged", "peerId": peer.peer_id, "roles": ["producer"], "meta": meta}
         elif "listener" in roles:
-            peer.role = PeerRole.LISTENER
-            # Send current producers list
-            for prod_id, prod in self.producers.items():
-                await self.send_message(peer, {
-                    "type": "peerStatusChanged",
-                    "peerId": prod_id,
-                    "roles": ["producer"],
-                    "meta": prod.meta
-                })
+            peer.role = "listener"
+            logger.info(f"Listener registered: {peer.peer_id}")
+        return None
 
-    async def handle_start_session(self, peer: Peer, message: dict):
-        """Handle consumer requesting session with producer."""
+    def get_producers_list(self) -> list:
+        """Get list of all producers."""
+        return [
+            {"id": p.peer_id, "meta": p.meta}
+            for p in self.producers.values()
+            if p.connected
+        ]
+
+    async def handle_start_session(self, peer: Peer, message: dict) -> dict:
+        """Handle session start request."""
         producer_id = message.get("peerId")
 
         if producer_id not in self.producers:
-            await self.send_message(peer, {
-                "type": "error",
-                "details": f"Producer {producer_id} not found"
-            })
-            return
+            return {"type": "error", "details": f"Producer {producer_id} not found"}
 
         producer = self.producers[producer_id]
         session_id = str(uuid.uuid4())
@@ -198,42 +161,30 @@ class SignalingServer:
         self.sessions[session_id] = (producer_id, peer.peer_id)
         peer.session_id = session_id
         peer.partner_id = producer_id
-        peer.role = PeerRole.CONSUMER
+        peer.role = "consumer"
         producer.session_id = session_id
         producer.partner_id = peer.peer_id
 
-        # Notify both peers
-        await self.send_message(peer, {
-            "type": "sessionStarted",
-            "peerId": producer_id,
-            "sessionId": session_id
-        })
-
-        await self.send_message(producer, {
+        # Notify producer
+        await self.send_to_peer(producer_id, {
             "type": "startSession",
             "peerId": peer.peer_id,
             "sessionId": session_id
         })
 
-        logger.info(f"Session started: {session_id} between producer {producer_id} and consumer {peer.peer_id}")
+        logger.info(f"Session started: {session_id}")
+        return {"type": "sessionStarted", "peerId": producer_id, "sessionId": session_id}
 
     async def handle_peer_message(self, peer: Peer, message: dict):
-        """Relay SDP/ICE messages between peers in a session."""
+        """Relay SDP/ICE messages between peers."""
         session_id = message.get("sessionId")
 
         if session_id not in self.sessions:
             logger.warning(f"Unknown session: {session_id}")
             return
 
-        # Find the other peer in the session
         producer_id, consumer_id = self.sessions[session_id]
         target_id = consumer_id if peer.peer_id == producer_id else producer_id
-
-        if target_id not in self.peers:
-            logger.warning(f"Target peer not found: {target_id}")
-            return
-
-        target = self.peers[target_id]
 
         # Relay the message
         relay_message = {
@@ -241,165 +192,132 @@ class SignalingServer:
             "sessionId": session_id,
             **{k: v for k, v in message.items() if k not in ["type", "sessionId"]}
         }
-
-        await self.send_message(target, relay_message)
+        await self.send_to_peer(target_id, relay_message)
         logger.debug(f"Relayed peer message from {peer.peer_id} to {target_id}")
 
-    async def handle_end_session(self, peer: Peer, message: dict):
-        """Handle session end request."""
-        session_id = message.get("sessionId")
-        if session_id:
-            await self.end_session(session_id)
-
-    async def end_session(self, session_id: str):
-        """End a session and notify peers."""
+    async def handle_end_session(self, session_id: str):
+        """End a session."""
         if session_id not in self.sessions:
             return
 
         producer_id, consumer_id = self.sessions[session_id]
 
-        # Notify peers
         for peer_id in [producer_id, consumer_id]:
             if peer_id in self.peers:
                 peer = self.peers[peer_id]
                 peer.session_id = None
                 peer.partner_id = None
-                await self.send_message(peer, {
-                    "type": "endSession",
-                    "sessionId": session_id
-                })
+                await self.send_to_peer(peer_id, {"type": "endSession", "sessionId": session_id})
 
         del self.sessions[session_id]
         logger.info(f"Session ended: {session_id}")
 
-    async def handle_command(self, peer: Peer, message: dict):
-        """Handle custom commands (robot control, etc.)."""
-        if not peer.partner_id or peer.partner_id not in self.peers:
-            logger.warning(f"No partner for command relay from {peer.peer_id}")
-            return
+    async def handle_message(self, peer: Peer, message: dict) -> Optional[dict]:
+        """Process incoming message and return response if any."""
+        msg_type = message.get("type", "")
+        logger.debug(f"Received from {peer.peer_id}: {msg_type}")
 
-        target = self.peers[peer.partner_id]
+        if msg_type == "setPeerStatus":
+            broadcast = self.handle_set_peer_status(peer, message)
+            if broadcast:
+                await self.broadcast_to_listeners(broadcast, exclude_id=peer.peer_id)
+            return None
 
-        # Relay command to partner
-        await self.send_message(target, {
-            "type": "command",
-            "from": peer.peer_id,
-            "data": message.get("data", {})
-        })
+        elif msg_type == "list":
+            return {"type": "list", "producers": self.get_producers_list()}
 
-        logger.debug(f"Command relayed from {peer.peer_id} to {target.peer_id}")
+        elif msg_type == "startSession":
+            return await self.handle_start_session(peer, message)
 
-    async def handle_message(self, peer: Peer, raw_message: str):
-        """Route incoming messages to appropriate handlers."""
-        try:
-            message = json.loads(raw_message)
-            msg_type = message.get("type", "")
+        elif msg_type == "peer":
+            await self.handle_peer_message(peer, message)
+            return None
 
-            logger.debug(f"Received from {peer.peer_id}: {msg_type}")
+        elif msg_type == "endSession":
+            await self.handle_end_session(message.get("sessionId"))
+            return None
 
-            if msg_type == "setPeerStatus":
-                await self.handle_set_peer_status(peer, message)
-            elif msg_type == "startSession":
-                await self.handle_start_session(peer, message)
-            elif msg_type == "peer":
-                await self.handle_peer_message(peer, message)
-            elif msg_type == "endSession":
-                await self.handle_end_session(peer, message)
-            elif msg_type == "command":
-                await self.handle_command(peer, message)
-            elif msg_type == "list":
-                # Return list of producers (GStreamer format uses "id" not "peerId")
-                producers_list = [
-                    {"id": p.peer_id, "meta": p.meta}
-                    for p in self.producers.values()
-                ]
-                await self.send_message(peer, {
-                    "type": "list",
-                    "producers": producers_list
-                })
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
+        else:
+            logger.warning(f"Unknown message type: {msg_type}")
+            return None
 
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON from {peer.peer_id}")
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
+    def disconnect_peer(self, peer_id: str):
+        """Mark peer as disconnected."""
+        if peer_id in self.peers:
+            peer = self.peers[peer_id]
+            peer.connected = False
+
+            # Remove from producers if applicable
+            if peer_id in self.producers:
+                del self.producers[peer_id]
+                logger.info(f"Producer disconnected: {peer_id}")
+
+            logger.info(f"Peer disconnected: {peer_id}")
 
 
 # Global signaling server instance
 signaling = SignalingServer()
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
-    """Main WebSocket endpoint for signaling.
+@app.get("/events")
+async def events(request: Request, token: str = Query(...)):
+    """SSE endpoint for receiving messages from server."""
+    logger.info(f"SSE connection request with token: {token[:20]}...")
 
-    Authentication methods (in order of priority):
-    1. Authorization header with Bearer token (for robots)
-    2. Token query parameter (for clients)
-    3. First message auth: {"type": "auth", "token": "..."} (for browsers)
-    """
-    logger.info(f"WebSocket connection attempt from {websocket.client}")
-
-    username = None
-
-    # Method 1: Check Authorization header (Bearer token) - used by robots
-    auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        bearer_token = auth_header[7:]  # Remove "Bearer " prefix
-        logger.info(f"Validating Bearer token...")
-        username = await validate_hf_token(bearer_token)
-        if username:
-            logger.info(f"Authenticated via Bearer token: {username}")
-
-    # Method 2: Validate token from query parameter
-    if not username and token:
-        logger.info(f"Validating query token...")
-        username = await validate_hf_token(token)
-        if username:
-            logger.info(f"Authenticated via query token: {username}")
-
-    # Accept the connection first (required for browsers)
-    await websocket.accept()
-    logger.info(f"WebSocket accepted, username so far: {username}")
-
-    # Method 3: If not authenticated yet, wait for auth message
+    username = await validate_hf_token(token)
     if not username:
-        logger.info("Waiting for auth message...")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    peer = signaling.get_or_create_peer(token, username)
+
+    async def event_generator() -> AsyncGenerator[dict, None]:
+        # Send welcome message
+        yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id})}
+
+        # Send current producers list for listeners
+        yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list()})}
+
         try:
-            # Wait up to 10 seconds for auth message
-            auth_msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-            auth_data = json.loads(auth_msg)
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
 
-            if auth_data.get("type") == "auth" and auth_data.get("token"):
-                username = await validate_hf_token(auth_data["token"])
-                if username:
-                    logger.info(f"Authenticated via first message: {username}")
-                    await websocket.send_text(json.dumps({"type": "authResult", "success": True}))
-        except asyncio.TimeoutError:
-            logger.warning("Auth timeout - no auth message received")
-        except Exception as e:
-            logger.warning(f"Auth error: {e}")
+                try:
+                    # Wait for message with timeout
+                    message = await asyncio.wait_for(peer.message_queue.get(), timeout=30.0)
+                    yield {"event": "message", "data": json.dumps(message)}
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    yield {"event": "ping", "data": ""}
 
+        finally:
+            signaling.disconnect_peer(peer.peer_id)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/send")
+async def send_message(request: Request, token: str = Query(...)):
+    """HTTP POST endpoint for sending messages to server."""
+    username = await validate_hf_token(token)
     if not username:
-        logger.warning(f"Authentication failed")
-        await websocket.send_text(json.dumps({"type": "authResult", "success": False, "error": "Authentication required"}))
-        await websocket.close(code=4001, reason="Authentication required")
-        return
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    logger.info(f"User authenticated: {username}")
-    peer = await signaling.register_peer(websocket, username)
+    # Get or reconnect peer
+    if token not in signaling.token_to_peer:
+        raise HTTPException(status_code=400, detail="Connect to /events first")
 
-    try:
-        while True:
-            message = await websocket.receive_text()
-            await signaling.handle_message(peer, message)
-    except WebSocketDisconnect:
-        logger.info(f"Peer disconnected: {peer.peer_id}")
-    except Exception as e:
-        logger.error(f"WebSocket error for {peer.peer_id}: {e}")
-    finally:
-        await signaling.unregister_peer(peer)
+    peer_id = signaling.token_to_peer[token]
+    if peer_id not in signaling.peers:
+        raise HTTPException(status_code=400, detail="Peer not found")
+
+    peer = signaling.peers[peer_id]
+
+    body = await request.json()
+    response = await signaling.handle_message(peer, body)
+
+    return response or {"status": "ok"}
 
 
 @app.get("/")
@@ -414,24 +332,23 @@ async def root():
             body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
             .status {{ padding: 10px; background: #e8f5e9; border-radius: 5px; }}
             code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
-            .auth {{ padding: 10px; background: #fff3e0; border-radius: 5px; margin-top: 10px; }}
         </style>
     </head>
     <body>
         <h1>Reachy Mini Central</h1>
         <div class="status">
             <p><strong>Status:</strong> Running</p>
-            <p><strong>Connected Peers:</strong> {len(signaling.peers)}</p>
+            <p><strong>Connected Peers:</strong> {len([p for p in signaling.peers.values() if p.connected])}</p>
             <p><strong>Active Producers:</strong> {len(signaling.producers)}</p>
             <p><strong>Active Sessions:</strong> {len(signaling.sessions)}</p>
         </div>
-        <div class="auth">
-            <p><strong>Authentication:</strong> HuggingFace token required</p>
-        </div>
-        <h2>WebSocket Endpoint</h2>
-        <p>Connect to: <code>wss://host/ws?token=YOUR_HF_TOKEN</code></p>
+        <h2>Endpoints</h2>
+        <ul>
+            <li><code>GET /events?token=...</code> - SSE stream for receiving messages</li>
+            <li><code>POST /send?token=...</code> - Send messages to server</li>
+        </ul>
         <h2>Protocol</h2>
-        <p>This server implements the GStreamer WebRTC signaling protocol.</p>
+        <p>This server implements the GStreamer WebRTC signaling protocol over HTTP/SSE.</p>
     </body>
     </html>
     """)
@@ -442,22 +359,7 @@ async def health():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "peers": len(signaling.peers),
+        "peers": len([p for p in signaling.peers.values() if p.connected]),
         "producers": len(signaling.producers),
         "sessions": len(signaling.sessions)
-    }
-
-
-@app.get("/api/producers")
-async def list_producers(token: str = Query(default="")):
-    """List all registered producers. Requires HF token."""
-    username = await validate_hf_token(token)
-    if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    return {
-        "producers": [
-            {"id": p.peer_id, "meta": p.meta}
-            for p in signaling.producers.values()
-        ]
     }
