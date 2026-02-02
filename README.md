@@ -6,6 +6,8 @@ colorTo: purple
 sdk: docker
 pinned: false
 app_port: 7860
+hf_oauth: true
+hf_oauth_expiration_minutes: 480
 ---
 
 # Reachy Mini Central

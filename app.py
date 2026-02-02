@@ -325,26 +325,27 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
     """Main WebSocket endpoint for signaling.
 
     Authentication methods (in order of priority):
-    1. HF proxy headers (for logged-in browser users accessing the Space)
-    2. Token query parameter (for robots/external clients)
+    1. Authorization header with Bearer token (for robots)
+    2. Token query parameter (for clients)
     """
     username = None
 
-    # Method 1: Check HF proxy headers (set by HuggingFace when user is logged in)
-    # HF adds these headers when authenticated users access a Space
-    hf_user = websocket.headers.get("HF-User") or websocket.headers.get("x-hf-user")
-    if hf_user:
-        username = hf_user
-        logger.info(f"Authenticated via HF proxy: {username}")
+    # Method 1: Check Authorization header (Bearer token) - used by robots
+    auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        bearer_token = auth_header[7:]  # Remove "Bearer " prefix
+        username = await validate_hf_token(bearer_token)
+        if username:
+            logger.info(f"Authenticated via Bearer token: {username}")
 
-    # Method 2: Validate token from query parameter
+    # Method 2: Validate token from query parameter - used by browser clients
     if not username and token:
         username = await validate_hf_token(token)
         if username:
-            logger.info(f"Authenticated via token: {username}")
+            logger.info(f"Authenticated via query token: {username}")
 
     if not username:
-        await websocket.close(code=4001, reason="Authentication required - please log in to HuggingFace or provide a token")
+        await websocket.close(code=4001, reason="Authentication required - provide a valid HuggingFace token")
         return
 
     await websocket.accept()
