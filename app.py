@@ -328,27 +328,36 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
     1. Authorization header with Bearer token (for robots)
     2. Token query parameter (for clients)
     """
+    logger.info(f"WebSocket connection attempt from {websocket.client}")
+    logger.info(f"Token provided: {bool(token)}, token prefix: {token[:20] if token else 'none'}...")
+
     username = None
 
     # Method 1: Check Authorization header (Bearer token) - used by robots
     auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         bearer_token = auth_header[7:]  # Remove "Bearer " prefix
+        logger.info(f"Validating Bearer token...")
         username = await validate_hf_token(bearer_token)
         if username:
             logger.info(f"Authenticated via Bearer token: {username}")
 
     # Method 2: Validate token from query parameter - used by browser clients
     if not username and token:
+        logger.info(f"Validating query token...")
         username = await validate_hf_token(token)
         if username:
             logger.info(f"Authenticated via query token: {username}")
 
     if not username:
+        logger.warning(f"Authentication failed - no valid token")
+        # Must accept before closing with custom code
+        await websocket.accept()
         await websocket.close(code=4001, reason="Authentication required - provide a valid HuggingFace token")
         return
 
     await websocket.accept()
+    logger.info(f"WebSocket accepted for user: {username}")
     peer = await signaling.register_peer(websocket, username)
 
     try:
