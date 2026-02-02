@@ -298,9 +298,9 @@ class SignalingServer:
             elif msg_type == "command":
                 await self.handle_command(peer, message)
             elif msg_type == "list":
-                # Return list of producers
+                # Return list of producers (GStreamer format uses "id" not "peerId")
                 producers_list = [
-                    {"peerId": p.peer_id, "meta": p.meta}
+                    {"id": p.peer_id, "meta": p.meta}
                     for p in self.producers.values()
                 ]
                 await self.send_message(peer, {
@@ -399,7 +399,7 @@ async def list_producers(token: str = Query(default="")):
 
     return {
         "producers": [
-            {"peerId": p.peer_id, "meta": p.meta}
+            {"id": p.peer_id, "meta": p.meta}
             for p in signaling.producers.values()
         ]
     }
