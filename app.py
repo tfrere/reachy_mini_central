@@ -337,9 +337,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
     Authentication methods (in order of priority):
     1. Authorization header with Bearer token (for robots)
     2. Token query parameter (for clients)
+    3. First message auth: {"type": "auth", "token": "..."} (for browsers)
     """
     logger.info(f"WebSocket connection attempt from {websocket.client}")
-    logger.info(f"Token provided: {bool(token)}, token prefix: {token[:20] if token else 'none'}...")
 
     username = None
 
@@ -352,22 +352,42 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         if username:
             logger.info(f"Authenticated via Bearer token: {username}")
 
-    # Method 2: Validate token from query parameter - used by browser clients
+    # Method 2: Validate token from query parameter
     if not username and token:
         logger.info(f"Validating query token...")
         username = await validate_hf_token(token)
         if username:
             logger.info(f"Authenticated via query token: {username}")
 
+    # Accept the connection first (required for browsers)
+    await websocket.accept()
+    logger.info(f"WebSocket accepted, username so far: {username}")
+
+    # Method 3: If not authenticated yet, wait for auth message
     if not username:
-        logger.warning(f"Authentication failed - no valid token")
-        # Must accept before closing with custom code
-        await websocket.accept()
-        await websocket.close(code=4001, reason="Authentication required - provide a valid HuggingFace token")
+        logger.info("Waiting for auth message...")
+        try:
+            # Wait up to 10 seconds for auth message
+            auth_msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            auth_data = json.loads(auth_msg)
+
+            if auth_data.get("type") == "auth" and auth_data.get("token"):
+                username = await validate_hf_token(auth_data["token"])
+                if username:
+                    logger.info(f"Authenticated via first message: {username}")
+                    await websocket.send_text(json.dumps({"type": "authResult", "success": True}))
+        except asyncio.TimeoutError:
+            logger.warning("Auth timeout - no auth message received")
+        except Exception as e:
+            logger.warning(f"Auth error: {e}")
+
+    if not username:
+        logger.warning(f"Authentication failed")
+        await websocket.send_text(json.dumps({"type": "authResult", "success": False, "error": "Authentication required"}))
+        await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await websocket.accept()
-    logger.info(f"WebSocket accepted for user: {username}")
+    logger.info(f"User authenticated: {username}")
     peer = await signaling.register_peer(websocket, username)
 
     try:
