@@ -11,6 +11,7 @@ This works reliably through HTTP/2 proxies like HuggingFace Spaces.
 import asyncio
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
@@ -37,6 +38,36 @@ app.add_middleware(
 
 # Cache for validated tokens (token -> username)
 token_cache: dict[str, str] = {}
+
+# Rate limiting: username -> (request_count, window_start)
+rate_limit_cache: dict[str, tuple[int, float]] = {}
+RATE_LIMIT_REQUESTS = 100  # Max requests per window
+RATE_LIMIT_WINDOW = 60  # Window in seconds
+
+
+def check_rate_limit(username: str) -> bool:
+    """Check if user is rate limited. Returns True if allowed, False if limited."""
+    now = time.time()
+
+    if username not in rate_limit_cache:
+        rate_limit_cache[username] = (1, now)
+        return True
+
+    count, window_start = rate_limit_cache[username]
+
+    # Reset window if expired
+    if now - window_start > RATE_LIMIT_WINDOW:
+        rate_limit_cache[username] = (1, now)
+        return True
+
+    # Check limit
+    if count >= RATE_LIMIT_REQUESTS:
+        logger.warning(f"Rate limit exceeded for user: {username}")
+        return False
+
+    # Increment counter
+    rate_limit_cache[username] = (count + 1, window_start)
+    return True
 
 
 async def validate_hf_token(token: str) -> Optional[str]:
@@ -117,10 +148,13 @@ class SignalingServer:
         if peer_id in self.peers:
             await self.peers[peer_id].message_queue.put(message)
 
-    async def broadcast_to_listeners(self, message: dict, exclude_id: str = None):
-        """Send message to all connected peers except the sender."""
+    async def broadcast_to_listeners(self, message: dict, exclude_id: str = None, owner_username: str = None):
+        """Send message to connected peers with same owner, except the sender."""
         for peer_id, peer in self.peers.items():
             if peer_id != exclude_id and peer.connected:
+                # If owner specified, only send to peers with same username
+                if owner_username and peer.username != owner_username:
+                    continue
                 await peer.message_queue.put(message)
 
     def handle_set_peer_status(self, peer: Peer, message: dict):
@@ -139,12 +173,12 @@ class SignalingServer:
             logger.info(f"Listener registered: {peer.peer_id}")
         return None
 
-    def get_producers_list(self) -> list:
-        """Get list of all producers."""
+    def get_producers_list(self, username: str) -> list:
+        """Get list of producers owned by the given user."""
         return [
             {"id": p.peer_id, "meta": p.meta}
             for p in self.producers.values()
-            if p.connected
+            if p.connected and p.username == username
         ]
 
     async def handle_start_session(self, peer: Peer, message: dict) -> dict:
@@ -155,6 +189,11 @@ class SignalingServer:
             return {"type": "error", "details": f"Producer {producer_id} not found"}
 
         producer = self.producers[producer_id]
+
+        # Security: verify the user owns this producer
+        if producer.username != peer.username:
+            logger.warning(f"User {peer.username} tried to access producer owned by {producer.username}")
+            return {"type": "error", "details": "Access denied: you don't own this robot"}
         session_id = str(uuid.uuid4())
 
         # Store session
@@ -220,11 +259,12 @@ class SignalingServer:
         if msg_type == "setPeerStatus":
             broadcast = self.handle_set_peer_status(peer, message)
             if broadcast:
-                await self.broadcast_to_listeners(broadcast, exclude_id=peer.peer_id)
+                # Only notify users with same username (owner)
+                await self.broadcast_to_listeners(broadcast, exclude_id=peer.peer_id, owner_username=peer.username)
             return None
 
         elif msg_type == "list":
-            return {"type": "list", "producers": self.get_producers_list()}
+            return {"type": "list", "producers": self.get_producers_list(peer.username)}
 
         elif msg_type == "startSession":
             return await self.handle_start_session(peer, message)
@@ -268,14 +308,17 @@ async def events(request: Request, token: str = Query(...)):
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    if not check_rate_limit(username):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+
     peer = signaling.get_or_create_peer(token, username)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
-        # Send welcome message
-        yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id})}
+        # Send welcome message with username for client info
+        yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id, "username": username})}
 
-        # Send current producers list for listeners
-        yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list()})}
+        # Send current producers list for listeners (filtered by owner)
+        yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list(username)})}
 
         try:
             while True:
@@ -304,6 +347,9 @@ async def send_message(request: Request, token: str = Query(...)):
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    if not check_rate_limit(username):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+
     # Get or reconnect peer
     if token not in signaling.token_to_peer:
         raise HTTPException(status_code=400, detail="Connect to /events first")
@@ -331,6 +377,7 @@ async def root():
         <style>
             body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
             .status {{ padding: 10px; background: #e8f5e9; border-radius: 5px; }}
+            .security {{ padding: 10px; background: #e3f2fd; border-radius: 5px; margin-top: 10px; }}
             code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
         </style>
     </head>
@@ -341,6 +388,14 @@ async def root():
             <p><strong>Connected Peers:</strong> {len([p for p in signaling.peers.values() if p.connected])}</p>
             <p><strong>Active Producers:</strong> {len(signaling.producers)}</p>
             <p><strong>Active Sessions:</strong> {len(signaling.sessions)}</p>
+        </div>
+        <div class="security">
+            <p><strong>Security:</strong></p>
+            <ul>
+                <li>HuggingFace token authentication required</li>
+                <li>Owner-based filtering: users only see their own robots</li>
+                <li>Rate limiting: {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s per user</li>
+            </ul>
         </div>
         <h2>Endpoints</h2>
         <ul>
