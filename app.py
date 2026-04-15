@@ -194,6 +194,24 @@ class SignalingServer:
         if producer.username != peer.username:
             logger.warning(f"User {peer.username} tried to access producer owned by {producer.username}")
             return {"type": "error", "details": "Access denied: you don't own this robot"}
+
+        # Concurrency gate: reject if producer already has an active session.
+        # The existing consumer's app name is read from its meta (set via setPeerStatus).
+        if producer.session_id is not None:
+            active_app = "another app"
+            if producer.partner_id and producer.partner_id in self.peers:
+                active_app = self.peers[producer.partner_id].meta.get("name") or active_app
+            logger.info(
+                f"Rejected session: producer {producer_id} busy with '{active_app}' "
+                f"(requested by {peer.peer_id}, app={peer.meta.get('name')!r})"
+            )
+            return {
+                "type": "sessionRejected",
+                "reason": "robot_busy",
+                "peerId": producer_id,
+                "activeApp": active_app,
+            }
+
         session_id = str(uuid.uuid4())
 
         # Store session
