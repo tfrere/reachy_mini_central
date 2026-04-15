@@ -252,22 +252,34 @@ class SignalingServer:
         await self.send_to_peer(target_id, relay_message)
         logger.debug(f"Relayed peer message from {peer.peer_id} to {target_id}")
 
-    async def handle_end_session(self, session_id: str):
-        """End a session."""
+    async def handle_end_session(self, session_id: str, reason: Optional[str] = None):
+        """End a session and notify both peers.
+
+        The optional ``reason`` is propagated to both peers so clients can
+        distinguish a user-initiated stop ("Session stopped") from a
+        server-side eviction (e.g. ``robot_busy_local_app`` when the robot
+        relay refuses because a local Python app holds the daemon lock).
+        Without forwarding the reason, clients see only an unexplained
+        endSession and have no way to surface a meaningful message.
+        """
         if session_id not in self.sessions:
             return
 
         producer_id, consumer_id = self.sessions[session_id]
+
+        msg: dict = {"type": "endSession", "sessionId": session_id}
+        if reason is not None:
+            msg["reason"] = reason
 
         for peer_id in [producer_id, consumer_id]:
             if peer_id in self.peers:
                 peer = self.peers[peer_id]
                 peer.session_id = None
                 peer.partner_id = None
-                await self.send_to_peer(peer_id, {"type": "endSession", "sessionId": session_id})
+                await self.send_to_peer(peer_id, msg)
 
         del self.sessions[session_id]
-        logger.info(f"Session ended: {session_id}")
+        logger.info(f"Session ended: {session_id} (reason={reason!r})")
 
     async def handle_message(self, peer: Peer, message: dict) -> Optional[dict]:
         """Process incoming message and return response if any."""
@@ -292,7 +304,10 @@ class SignalingServer:
             return None
 
         elif msg_type == "endSession":
-            await self.handle_end_session(message.get("sessionId"))
+            await self.handle_end_session(
+                message.get("sessionId"),
+                reason=message.get("reason"),
+            )
             return None
 
         else:
