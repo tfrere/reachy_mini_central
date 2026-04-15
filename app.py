@@ -436,3 +436,49 @@ async def health():
         "producers": len(signaling.producers),
         "sessions": len(signaling.sessions)
     }
+
+
+@app.get("/api/robot-status")
+async def robot_status(token: str = Query(default="")):
+    """Return busy/free status and currently-connected app for each robot owned by the caller.
+
+    Used by clients (e.g. the desktop app) to render a passive status indicator
+    without consuming a session slot. Filtered by HuggingFace username so users
+    only see their own robots.
+
+    Response shape:
+        {
+            "robots": [
+                {
+                    "peerId": "...",
+                    "robotName": "reachy_mini",
+                    "busy": true,
+                    "activeApp": "Hand Tracker Live App Demo"
+                },
+                ...
+            ]
+        }
+    """
+    username = await validate_hf_token(token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+
+    robots = []
+    for pid, p in signaling.producers.items():
+        if p.username != username:
+            continue
+        active_app = None
+        if p.session_id and p.partner_id and p.partner_id in signaling.peers:
+            active_app = signaling.peers[p.partner_id].meta.get("name")
+        robots.append(
+            {
+                "peerId": pid,
+                "robotName": p.meta.get("name"),
+                "busy": p.session_id is not None,
+                "activeApp": active_app,
+            }
+        )
+
+    return {"robots": robots}
