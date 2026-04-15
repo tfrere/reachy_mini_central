@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
@@ -299,18 +299,32 @@ class SignalingServer:
             logger.warning(f"Unknown message type: {msg_type}")
             return None
 
-    def disconnect_peer(self, peer_id: str):
-        """Mark peer as disconnected."""
-        if peer_id in self.peers:
-            peer = self.peers[peer_id]
-            peer.connected = False
+    async def disconnect_peer(self, peer_id: str):
+        """Mark peer as disconnected and release any session it was holding.
 
-            # Remove from producers if applicable
-            if peer_id in self.producers:
-                del self.producers[peer_id]
-                logger.info(f"Producer disconnected: {peer_id}")
+        Releasing the session is critical: without it, a producer's session_id
+        stays set forever when a consumer's SSE stream drops (tab close, network
+        failure), and the robot becomes permanently locked until the server
+        restarts.
+        """
+        if peer_id not in self.peers:
+            return
 
-            logger.info(f"Peer disconnected: {peer_id}")
+        peer = self.peers[peer_id]
+        peer.connected = False
+
+        # End any session this peer is part of (either as producer or consumer).
+        # handle_end_session clears session_id/partner_id on both sides and
+        # notifies the remaining peer so it can tear down its WebRTC state.
+        if peer.session_id is not None:
+            await self.handle_end_session(peer.session_id)
+
+        # Remove from producers if applicable
+        if peer_id in self.producers:
+            del self.producers[peer_id]
+            logger.info(f"Producer disconnected: {peer_id}")
+
+        logger.info(f"Peer disconnected: {peer_id}")
 
 
 # Global signaling server instance
@@ -353,7 +367,7 @@ async def events(request: Request, token: str = Query(...)):
                     yield {"event": "ping", "data": ""}
 
         finally:
-            signaling.disconnect_peer(peer.peer_id)
+            await signaling.disconnect_peer(peer.peer_id)
 
     return EventSourceResponse(event_generator())
 
