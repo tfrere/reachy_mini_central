@@ -27,11 +27,17 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Reachy Mini Central")
 
-# Add CORS middleware for browser clients
+# Add CORS middleware for browser clients.
+#
+# allow_credentials=False is intentional: authentication here uses the
+# Authorization header (Bearer <HF token>), not cookies. Combining
+# allow_credentials=True with allow_origins=["*"] is a CORS spec
+# violation (browsers reject credentialed wildcard-origin requests),
+# and we don't need credentialed mode for header-based auth to work.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -70,39 +76,77 @@ def check_rate_limit(username: str) -> bool:
     return True
 
 
+# Set of peer-IP strings that have already triggered a query-string
+# deprecation warning in this process. Sampled this way so a chatty
+# legacy client reconnecting SSE every 30s doesn't flood logs with
+# identical WARNINGs. Bounded by natural client cardinality; we also
+# cap it to avoid unbounded growth from hostile callers.
+_deprecation_warned_ips: set[str] = set()
+_DEPRECATION_WARNED_MAX = 1024
+
+
+def _warn_deprecated_query_once(request: Request) -> None:
+    """Emit the ?token= deprecation warning at most once per client IP."""
+    client_ip = request.client.host if request.client else "<unknown>"
+    if client_ip in _deprecation_warned_ips:
+        return
+    if len(_deprecation_warned_ips) < _DEPRECATION_WARNED_MAX:
+        _deprecation_warned_ips.add(client_ip)
+    logger.warning(
+        "[deprecation] HF token received via query string from %s. "
+        "Switch to Authorization: Bearer <token> — the query form "
+        "will be removed in a future release.",
+        client_ip,
+    )
+
+
 async def _resolve_hf_token(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     token: str = Query(default=""),
 ) -> str:
-    """FastAPI dependency: get the HF token from the Authorization header or ?token=.
+    """FastAPI dependency: return the HF token from the Authorization header or ?token=.
 
-    The ``Authorization: Bearer <token>`` header is preferred because it
-    keeps the token out of URLs, server access logs, browser history, and
-    referer headers. The ``?token=`` query parameter is kept as a
-    backwards-compatible fallback for older clients and logs a deprecation
-    warning when used. Plan to remove the query fallback in a future
-    release once all known clients (reachy_mini relay, reachy-mini.js,
-    daemon /api/hf-auth proxy) have shipped the header switch.
+    Accepts **only** ``Authorization: Bearer <token>``. The ``?token=``
+    query parameter remains a transitional fallback for older clients
+    that predate the header switch; each new client IP triggers one
+    deprecation warning. The query fallback will be removed once all
+    known clients (reachy_mini relay, reachy-mini.js, daemon
+    /api/hf-auth proxy) ship the header form and deprecation logs go
+    silent.
 
-    Returns an empty string if neither is provided; callers must then
-    raise 401 themselves (mirrors the previous behaviour where
-    ``validate_hf_token("")`` returned ``None``).
+    Raises ``HTTPException(401, "Missing token")`` if neither form is
+    present. Centralising the 401 here avoids copy-paste post-checks
+    in each endpoint (where they would drift).
+
+    Notes on the narrow Bearer-only parse:
+    - No "bare string" fallback: returning an arbitrary ``Authorization``
+      header value (e.g. ``Basic <b64>``) would still fail token
+      validation, but a garbage value would land in ``token_cache`` as a
+      cache miss, polluting the cache. There are no known clients that
+      send a bare token, so we strictly reject anything that isn't
+      RFC 6750-shaped.
+    - Trim whitespace between scheme and token but require a non-empty
+      token after the scheme — otherwise ``Authorization: Bearer`` with
+      nothing after would slip through.
     """
     if authorization:
-        # Accept "Bearer <token>" (RFC 6750) or a bare token for leniency.
+        # RFC 6750: "Bearer" + single space + non-empty b64token.
+        # Case-insensitive scheme per RFC 7235 §2.1.
         scheme, _, value = authorization.partition(" ")
-        if scheme.lower() == "bearer" and value:
-            return value
-        # Tolerate older callers that send the raw token in the header.
-        return authorization
-    if token:
-        logger.warning(
-            "[deprecation] HF token received via query string. "
-            "Switch to Authorization: Bearer <token> — the query form "
-            "will be removed in a future release."
+        if scheme.lower() == "bearer" and value.strip():
+            return value.strip()
+        # Unknown scheme (Basic, Digest, bare token, etc.) — refuse.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header must use Bearer scheme",
         )
+    if token:
+        _warn_deprecated_query_once(request)
         return token
-    return ""
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token"
+    )
 
 
 async def validate_hf_token(token: str) -> Optional[str]:
@@ -384,13 +428,11 @@ signaling = SignalingServer()
 @app.get("/events")
 async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     """SSE endpoint for receiving messages from server."""
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing token")
-    logger.info(f"SSE connection request with token: {token[:20]}...")
-
     username = await validate_hf_token(token)
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    logger.info("SSE connection request from user: %s", username)
 
     if not check_rate_limit(username):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
@@ -427,8 +469,6 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 @app.post("/send")
 async def send_message(request: Request, token: str = Depends(_resolve_hf_token)):
     """HTTP POST endpoint for sending messages to server."""
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing token")
     username = await validate_hf_token(token)
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
