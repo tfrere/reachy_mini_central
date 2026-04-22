@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
@@ -68,6 +68,41 @@ def check_rate_limit(username: str) -> bool:
     # Increment counter
     rate_limit_cache[username] = (count + 1, window_start)
     return True
+
+
+async def _resolve_hf_token(
+    authorization: Optional[str] = Header(default=None),
+    token: str = Query(default=""),
+) -> str:
+    """FastAPI dependency: get the HF token from the Authorization header or ?token=.
+
+    The ``Authorization: Bearer <token>`` header is preferred because it
+    keeps the token out of URLs, server access logs, browser history, and
+    referer headers. The ``?token=`` query parameter is kept as a
+    backwards-compatible fallback for older clients and logs a deprecation
+    warning when used. Plan to remove the query fallback in a future
+    release once all known clients (reachy_mini relay, reachy-mini.js,
+    daemon /api/hf-auth proxy) have shipped the header switch.
+
+    Returns an empty string if neither is provided; callers must then
+    raise 401 themselves (mirrors the previous behaviour where
+    ``validate_hf_token("")`` returned ``None``).
+    """
+    if authorization:
+        # Accept "Bearer <token>" (RFC 6750) or a bare token for leniency.
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            return value
+        # Tolerate older callers that send the raw token in the header.
+        return authorization
+    if token:
+        logger.warning(
+            "[deprecation] HF token received via query string. "
+            "Switch to Authorization: Bearer <token> — the query form "
+            "will be removed in a future release."
+        )
+        return token
+    return ""
 
 
 async def validate_hf_token(token: str) -> Optional[str]:
@@ -347,8 +382,10 @@ signaling = SignalingServer()
 
 
 @app.get("/events")
-async def events(request: Request, token: str = Query(...)):
+async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     """SSE endpoint for receiving messages from server."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
     logger.info(f"SSE connection request with token: {token[:20]}...")
 
     username = await validate_hf_token(token)
@@ -388,8 +425,10 @@ async def events(request: Request, token: str = Query(...)):
 
 
 @app.post("/send")
-async def send_message(request: Request, token: str = Query(...)):
+async def send_message(request: Request, token: str = Depends(_resolve_hf_token)):
     """HTTP POST endpoint for sending messages to server."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
     username = await validate_hf_token(token)
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -468,7 +507,7 @@ async def health():
 
 
 @app.get("/api/robot-status")
-async def robot_status(token: str = Query(default="")):
+async def robot_status(token: str = Depends(_resolve_hf_token)):
     """Return busy/free status and currently-connected app for each robot owned by the caller.
 
     Used by clients (e.g. the desktop app) to render a passive status indicator
