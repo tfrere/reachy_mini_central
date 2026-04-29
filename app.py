@@ -6,13 +6,27 @@ This server implements the GStreamer WebRTC signaling protocol using:
 - HTTP POST for client-to-server messages
 
 This works reliably through HTTP/2 proxies like HuggingFace Spaces.
+
+Lifecycle responsibilities (see ``reachy_mini/docs/SIGNALING.md`` for the
+canonical contract):
+
+- Forward producer ``meta`` verbatim to listeners (no re-interpretation).
+- Track ``last_seen`` per peer; evict peers whose lease has expired.
+- Honour ``setPeerStatus(roles=[])`` by removing the peer from
+  ``producers`` immediately (the SSE channel stays open so the daemon
+  can re-register without reconnecting).
+- Detect ``install_id`` collisions inside a single user's fleet and
+  evict the older producer (last-writer-wins) so a re-flashed daemon
+  never coexists with its own ghost.
 """
 
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
 
@@ -25,7 +39,40 @@ from sse_starlette.sse import EventSourceResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reachy Mini Central")
+
+# --- Liveness (TTL / lease) settings ---------------------------------
+#
+# A peer is considered alive while it keeps its SSE channel open AND
+# its last application-level activity (POST /send or SSE message
+# delivery) is younger than ``LEASE_SECONDS``. The sweeper task scans
+# every ``SWEEPER_INTERVAL_SECONDS`` and evicts any expired peer.
+#
+# The lease has to comfortably outlast the worst-case daemon status
+# tick gap (1 s today, plus any HF Space cold-start latency on a POST
+# round-trip) so a healthy daemon never gets falsely evicted. 45 s
+# is roughly 30x that worst case.
+#
+# Tunable via env vars for local testing of failure paths without a
+# code change.
+LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "45"))
+SWEEPER_INTERVAL_SECONDS = float(os.getenv("REACHY_CENTRAL_SWEEPER_INTERVAL", "10"))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Spawn / cancel the TTL sweeper task alongside the FastAPI app."""
+    sweeper_task = asyncio.create_task(signaling.run_ttl_sweeper())
+    try:
+        yield
+    finally:
+        sweeper_task.cancel()
+        try:
+            await sweeper_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Reachy Mini Central", lifespan=_lifespan)
 
 # Add CORS middleware for browser clients.
 #
@@ -182,7 +229,14 @@ async def validate_hf_token(token: str) -> Optional[str]:
 
 @dataclass
 class Peer:
-    """Represents a connected peer (robot or client)."""
+    """Represents a connected peer (robot or client).
+
+    ``last_seen`` is updated on every application-level message either
+    direction (POST /send received, SSE message delivered) and is the
+    sole input to the TTL sweeper. SSE keepalive ``ping`` events do
+    NOT bump it - they are server-originated and would defeat the
+    "is the peer actually answering us?" check.
+    """
     peer_id: str
     username: str
     role: Optional[str] = None
@@ -191,6 +245,7 @@ class Peer:
     connected: bool = True
     session_id: Optional[str] = None
     partner_id: Optional[str] = None
+    last_seen: float = field(default_factory=time.monotonic)
 
 
 class SignalingServer:
@@ -200,8 +255,66 @@ class SignalingServer:
         self.peers: dict[str, Peer] = {}
         self.sessions: dict[str, tuple[str, str]] = {}  # session_id -> (producer_id, consumer_id)
         self.producers: dict[str, Peer] = {}  # producer_id -> Peer
-        # Token to peer_id mapping for reconnection
+        # Token -> peer_id mapping. Lets a daemon recover its peer_id
+        # across an SSE reconnect without losing its producer slot, but
+        # is purged on disconnect so a hard-evicted peer doesn't come
+        # back with the same id.
         self.token_to_peer: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Liveness bookkeeping
+    # ------------------------------------------------------------------
+
+    def touch(self, peer_id: str) -> None:
+        """Refresh ``last_seen`` for an active peer.
+
+        Called by every code path that proves the peer is still
+        actually answering: POST /send arriving from it, SSE message
+        successfully yielded to it. Server-side keepalive pings do
+        NOT call this (they prove only that we're alive, not them).
+        """
+        peer = self.peers.get(peer_id)
+        if peer is not None:
+            peer.last_seen = time.monotonic()
+
+    async def run_ttl_sweeper(self) -> None:
+        """Background task: evict peers whose lease has expired.
+
+        See ``LEASE_SECONDS`` and ``SWEEPER_INTERVAL_SECONDS`` at the
+        top of the module. We snapshot the peer ids before iterating
+        because ``disconnect_peer`` mutates ``self.peers``.
+        """
+        logger.info(
+            "TTL sweeper running every %.1fs, lease=%.1fs",
+            SWEEPER_INTERVAL_SECONDS,
+            LEASE_SECONDS,
+        )
+        while True:
+            try:
+                await asyncio.sleep(SWEEPER_INTERVAL_SECONDS)
+                cutoff = time.monotonic() - LEASE_SECONDS
+                stale = [
+                    peer_id
+                    for peer_id, peer in self.peers.items()
+                    if peer.last_seen < cutoff
+                ]
+                for peer_id in stale:
+                    logger.info(
+                        "Lease expired (%.1fs idle): evicting peer %s",
+                        time.monotonic() - self.peers[peer_id].last_seen,
+                        peer_id,
+                    )
+                    await self.disconnect_peer(peer_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # The sweeper is best-effort; never let one bad iteration
+                # kill the loop and stop us from cleaning up future zombies.
+                logger.exception("TTL sweeper iteration failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Peer lifecycle
+    # ------------------------------------------------------------------
 
     def get_or_create_peer(self, token: str, username: str) -> Peer:
         """Get existing peer or create new one."""
@@ -211,6 +324,7 @@ class SignalingServer:
             if peer_id in self.peers:
                 peer = self.peers[peer_id]
                 peer.connected = True
+                peer.last_seen = time.monotonic()
                 logger.info(f"Peer reconnected: {peer_id}")
                 return peer
 
@@ -236,21 +350,117 @@ class SignalingServer:
                     continue
                 await peer.message_queue.put(message)
 
-    def handle_set_peer_status(self, peer: Peer, message: dict):
-        """Handle peer status update (producer/listener registration)."""
+    async def handle_set_peer_status(self, peer: Peer, message: dict) -> Optional[dict]:
+        """Handle peer status update (producer/listener registration).
+
+        Three cases:
+
+        - ``roles=["producer"]``: register / refresh as producer. If the
+          payload's ``meta.install_id`` collides with an existing producer
+          of the same user, evict that older producer first
+          (last-writer-wins, see ``docs/SIGNALING.md``). Broadcast a
+          ``peerStatusChanged`` event so listeners learn about the new
+          producer.
+
+        - ``roles=["listener"]``: mark as listener, no broadcast.
+
+        - ``roles=[]``: explicit withdraw. The peer wants to be removed
+          from ``producers`` but keep its SSE channel open so it can
+          re-register later. We end any active session it had, drop it
+          from ``producers``, and tell other listeners (same user) so
+          their UI clears the row immediately - no waiting for a TTL
+          or SSE close.
+        """
         roles = message.get("roles", [])
         meta = message.get("meta", {})
         peer.meta = meta
 
         if "producer" in roles:
+            await self._evict_install_id_collisions(peer, meta)
             peer.role = "producer"
             self.producers[peer.peer_id] = peer
             logger.info(f"Producer registered: {peer.peer_id} with meta: {meta}")
-            return {"type": "peerStatusChanged", "peerId": peer.peer_id, "roles": ["producer"], "meta": meta}
+            return {
+                "type": "peerStatusChanged",
+                "peerId": peer.peer_id,
+                "roles": ["producer"],
+                "meta": meta,
+            }
         elif "listener" in roles:
             peer.role = "listener"
             logger.info(f"Listener registered: {peer.peer_id}")
+            return None
+        else:
+            # Explicit withdraw: roles=[]
+            return await self._withdraw_peer(peer, meta)
+
+    async def _withdraw_peer(self, peer: Peer, meta: dict) -> Optional[dict]:
+        """Remove a peer from the producer list at its own request.
+
+        Symmetric to a producer registration: clear ``producers``,
+        end the active session if any, broadcast a
+        ``peerStatusChanged(roles=[])`` so other listeners (same user)
+        update their UI without waiting for a TTL.
+
+        We deliberately keep the peer in ``self.peers`` and keep its
+        SSE channel open, so the daemon can ``setPeerStatus(producer)``
+        again later if the underlying issue clears (USB replugged,
+        backend recovered).
+        """
+        was_producer = peer.peer_id in self.producers
+        if peer.session_id is not None:
+            await self.handle_end_session(peer.session_id, reason="producer_withdrew")
+        if was_producer:
+            del self.producers[peer.peer_id]
+            logger.info(
+                "Producer withdrew: %s (meta=%s)", peer.peer_id, meta
+            )
+        peer.role = None
+        if was_producer:
+            return {
+                "type": "peerStatusChanged",
+                "peerId": peer.peer_id,
+                "roles": [],
+                "meta": meta,
+            }
         return None
+
+    async def _evict_install_id_collisions(self, new_peer: Peer, new_meta: dict) -> None:
+        """Last-writer-wins on ``meta.install_id`` collisions.
+
+        A re-flashed daemon, a duplicated SD card, or a stale tray
+        process can register a producer whose ``install_id`` matches
+        an already-registered producer of the same user. Without
+        eviction we'd carry both forever and the mobile app would see
+        the robot twice. Policy: keep the newcomer, drop the older.
+
+        Owner-scoped: a different HF user holding the same
+        ``install_id`` (collisions are unlikely with UUID4 but
+        possible during a hardware swap between two accounts) is left
+        alone here - cross-tenant collisions are out of scope for the
+        signaling server, the auth layer above us guarantees isolation.
+        """
+        new_install_id = new_meta.get("install_id")
+        if not new_install_id:
+            return
+
+        for old_id, old_peer in list(self.producers.items()):
+            if old_id == new_peer.peer_id:
+                continue
+            if old_peer.username != new_peer.username:
+                continue
+            if old_peer.meta.get("install_id") != new_install_id:
+                continue
+            logger.info(
+                "install_id collision: %s already held by peer %s, evicting older",
+                new_install_id,
+                old_id,
+            )
+            if old_peer.session_id is not None:
+                await self.handle_end_session(
+                    old_peer.session_id, reason="install_id_takeover"
+                )
+            await self.disconnect_peer(old_id)
 
     def get_producers_list(self, username: str) -> list:
         """Get list of producers owned by the given user."""
@@ -366,7 +576,7 @@ class SignalingServer:
         logger.debug(f"Received from {peer.peer_id}: {msg_type}")
 
         if msg_type == "setPeerStatus":
-            broadcast = self.handle_set_peer_status(peer, message)
+            broadcast = await self.handle_set_peer_status(peer, message)
             if broadcast:
                 # Only notify users with same username (owner)
                 await self.broadcast_to_listeners(broadcast, exclude_id=peer.peer_id, owner_username=peer.username)
@@ -394,12 +604,24 @@ class SignalingServer:
             return None
 
     async def disconnect_peer(self, peer_id: str):
-        """Mark peer as disconnected and release any session it was holding.
+        """Fully evict a peer from every server-side structure.
 
-        Releasing the session is critical: without it, a producer's session_id
-        stays set forever when a consumer's SSE stream drops (tab close, network
-        failure), and the robot becomes permanently locked until the server
-        restarts.
+        Called from three places:
+
+        - SSE close path (``request.is_disconnected()`` becoming true).
+        - The TTL sweeper, when a peer goes silent for ``LEASE_SECONDS``.
+        - ``_evict_install_id_collisions``, when a duplicate registers.
+
+        Cleanup is exhaustive on purpose: ``peers``, ``producers``,
+        ``token_to_peer`` and the active session are all cleared.
+        Without that, a peer left as ``connected=False`` would
+        accumulate forever in ``peers`` (memory leak) and a daemon
+        whose token re-binds to its old, now-zombie ``peer_id`` would
+        come back wired into a dead message_queue.
+
+        Any consumer waiting on its message_queue is signaled by the
+        ``endSession`` broadcast in ``handle_end_session``; the
+        message_queue itself is GC'd alongside the Peer object.
         """
         if peer_id not in self.peers:
             return
@@ -413,9 +635,32 @@ class SignalingServer:
         if peer.session_id is not None:
             await self.handle_end_session(peer.session_id)
 
-        # Remove from producers if applicable
-        if peer_id in self.producers:
+        # If we were a producer, tell same-user listeners now so their
+        # UI updates without waiting for a fresh /list.
+        was_producer = peer_id in self.producers
+        if was_producer:
             del self.producers[peer_id]
+
+        # Drop any token mapping pointing at this peer. A reconnect on
+        # the same token will mint a fresh peer_id.
+        for tok, pid in list(self.token_to_peer.items()):
+            if pid == peer_id:
+                del self.token_to_peer[tok]
+
+        # Finally evict the Peer object itself.
+        del self.peers[peer_id]
+
+        if was_producer:
+            await self.broadcast_to_listeners(
+                {
+                    "type": "peerStatusChanged",
+                    "peerId": peer_id,
+                    "roles": [],
+                    "meta": peer.meta,
+                },
+                exclude_id=peer_id,
+                owner_username=peer.username,
+            )
             logger.info(f"Producer disconnected: {peer_id}")
 
         logger.info(f"Peer disconnected: {peer_id}")
@@ -440,6 +685,10 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     peer = signaling.get_or_create_peer(token, username)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
+        # The welcome and initial list count as application activity:
+        # if we got this far, the SSE handshake completed and the
+        # client is reading from us.
+        signaling.touch(peer.peer_id)
         # Send welcome message with username for client info
         yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id, "username": username})}
 
@@ -455,9 +704,18 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                 try:
                     # Wait for message with timeout
                     message = await asyncio.wait_for(peer.message_queue.get(), timeout=30.0)
+                    # Real message yielded -> the peer is being talked
+                    # to AND we'll know via the next POST whether they
+                    # received it. Refresh the lease so an active peer
+                    # is never falsely evicted by the sweeper.
+                    signaling.touch(peer.peer_id)
                     yield {"event": "message", "data": json.dumps(message)}
                 except asyncio.TimeoutError:
-                    # Send keepalive
+                    # Server-side keepalive only. Intentionally NOT
+                    # ``touch``ing here: a ping proves the server is
+                    # alive, not the peer. If the peer is silent for
+                    # ``LEASE_SECONDS`` the sweeper evicts even
+                    # while pings keep flowing, which is what we want.
                     yield {"event": "ping", "data": ""}
 
         finally:
@@ -485,6 +743,11 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
         raise HTTPException(status_code=400, detail="Peer not found")
 
     peer = signaling.peers[peer_id]
+    # POST /send is the strongest "the peer is alive" signal we have:
+    # the daemon explicitly chose to talk to us right now. Refresh the
+    # lease before processing so the sweeper never preempts in-flight
+    # work.
+    signaling.touch(peer_id)
 
     body = await request.json()
     response = await signaling.handle_message(peer, body)
@@ -542,7 +805,9 @@ async def health():
         "status": "healthy",
         "peers": len([p for p in signaling.peers.values() if p.connected]),
         "producers": len(signaling.producers),
-        "sessions": len(signaling.sessions)
+        "sessions": len(signaling.sessions),
+        "lease_seconds": LEASE_SECONDS,
+        "sweeper_interval_seconds": SWEEPER_INTERVAL_SECONDS,
     }
 
 
