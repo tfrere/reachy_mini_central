@@ -272,12 +272,24 @@ class SignalingServer:
     # ------------------------------------------------------------------
 
     def touch(self, peer_id: str) -> None:
-        """Refresh ``last_seen`` for an active peer.
+        """Refresh ``last_seen`` on inbound application traffic.
 
-        Called by every code path that proves the peer is still
-        actually answering: POST /send arriving from it, SSE message
-        successfully yielded to it. Server-side keepalive pings do
-        NOT call this (they prove only that we're alive, not them).
+        Called by the only code paths that prove the peer is actually
+        reachable: a ``POST /send`` arriving from it, or a session
+        message successfully delivered through its message queue
+        (which the consumer side will ack via its own POST round-trip).
+
+        Server-side SSE keepalive pings do NOT call this. A keepalive
+        is just us writing into the local TCP send buffer and observing
+        no immediate error. On a half-open connection (peer's network
+        cut without a clean FIN/RST) the buffer happily absorbs writes
+        for minutes, so refreshing ``last_seen`` on every keepalive
+        would hold zombie peers alive forever - exactly the bug we
+        had before the heartbeat protocol was introduced. Heartbeats
+        are now driven by the daemon (re-emitting ``setPeerStatus``
+        every ``HEARTBEAT_INTERVAL_SECONDS`` even when its meta is
+        unchanged), which arrives here as a real ``POST /send`` and
+        does refresh the lease.
         """
         peer = self.peers.get(peer_id)
         if peer is not None:
@@ -691,11 +703,13 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
     peer = signaling.get_or_create_peer(token, username)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
-        # The welcome and initial list count as application activity:
-        # if we got this far, the SSE handshake completed and the
-        # client is reading from us.
-        signaling.touch(peer.peer_id)
-        # Send welcome message with username for client info
+        # Send welcome message with username for client info. We do
+        # NOT touch ``last_seen`` here: a fresh peer was just created
+        # by ``get_or_create_peer`` (which seeded ``last_seen``), and
+        # touching on outbound writes is unsound liveness anyway.
+        # Inbound traffic (POST /send) is the only authoritative
+        # signal, and the daemon's heartbeat will produce one within
+        # ``HEARTBEAT_INTERVAL_SECONDS``.
         yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id, "username": username})}
 
         # Send current producers list for listeners (filtered by owner)
@@ -703,35 +717,37 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 
         try:
             while True:
-                # Check if client disconnected
+                # Check if client disconnected. This is best-effort:
+                # ``is_disconnected`` returns True on FIN/RST visible
+                # to starlette, but half-open sockets can stay False
+                # for minutes behind HTTP/2 proxies. The TTL sweeper
+                # is the authoritative cleanup path for those.
                 if await request.is_disconnected():
                     break
 
                 try:
-                    # Wait for message with timeout
+                    # Wait for message with timeout. A queued message
+                    # exists because some other peer (typically a
+                    # consumer) sent us application traffic that we
+                    # are forwarding here. That counts as evidence
+                    # that the addressee was relevant; we refresh
+                    # ``last_seen`` so an in-flight session never
+                    # races the sweeper.
                     message = await asyncio.wait_for(peer.message_queue.get(), timeout=30.0)
-                    # Real message yielded -> the peer is being talked
-                    # to AND we'll know via the next POST whether they
-                    # received it. Refresh the lease so an active peer
-                    # is never falsely evicted by the sweeper.
                     signaling.touch(peer.peer_id)
                     yield {"event": "message", "data": json.dumps(message)}
                 except asyncio.TimeoutError:
-                    # The keepalive yield only happens after the
-                    # ``await request.is_disconnected()`` check at the
-                    # top of the loop returns False, i.e. the SSE
-                    # stream is still flowing to the peer's TCP socket.
-                    # That is a strong-enough liveness proof: if the
-                    # client had hung, ``is_disconnected`` would catch
-                    # it and we'd break out instead of yielding.
-                    #
-                    # Refreshing here is critical for the producer-
-                    # idle-but-online case: a daemon registers as a
-                    # producer and then waits for sessions, doing zero
-                    # POSTs. Without this touch the sweeper would
-                    # evict it after ``LEASE_SECONDS`` even though the
-                    # SSE channel is healthy.
-                    signaling.touch(peer.peer_id)
+                    # Server-pushed keepalive. Its ONLY job is to keep
+                    # the HTTP/2 proxy in front of us from killing the
+                    # idle connection (HF Spaces, Cloudflare, etc.).
+                    # We deliberately do NOT ``touch()`` here: a yield
+                    # that doesn't raise proves nothing about the
+                    # peer's reachability (the local TCP send buffer
+                    # absorbs writes silently on half-open sockets).
+                    # The daemon's heartbeat (every
+                    # ``HEARTBEAT_INTERVAL_SECONDS``, arriving as a
+                    # POST /send) is the authoritative liveness
+                    # signal. See ``docs/SIGNALING.md``.
                     yield {"event": "ping", "data": ""}
 
         finally:
