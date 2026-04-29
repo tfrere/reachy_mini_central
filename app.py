@@ -231,11 +231,17 @@ async def validate_hf_token(token: str) -> Optional[str]:
 class Peer:
     """Represents a connected peer (robot or client).
 
-    ``last_seen`` is updated on every application-level message either
-    direction (POST /send received, SSE message delivered) and is the
-    sole input to the TTL sweeper. SSE keepalive ``ping`` events do
-    NOT bump it - they are server-originated and would defeat the
-    "is the peer actually answering us?" check.
+    ``last_seen`` is the sole input to the TTL sweeper. We refresh it
+    on every signal that the peer is still wired to us:
+
+    - POST /send received from this peer (strongest signal).
+    - SSE keepalive yielded after a successful
+      ``await request.is_disconnected() == False`` check (the yield
+      proves the TCP stream is still flowing to the peer's socket).
+    - SSE message delivered.
+
+    We deliberately do NOT touch on internal server bookkeeping that
+    has no causal link to peer reachability.
     """
     peer_id: str
     username: str
@@ -711,11 +717,21 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
                     signaling.touch(peer.peer_id)
                     yield {"event": "message", "data": json.dumps(message)}
                 except asyncio.TimeoutError:
-                    # Server-side keepalive only. Intentionally NOT
-                    # ``touch``ing here: a ping proves the server is
-                    # alive, not the peer. If the peer is silent for
-                    # ``LEASE_SECONDS`` the sweeper evicts even
-                    # while pings keep flowing, which is what we want.
+                    # The keepalive yield only happens after the
+                    # ``await request.is_disconnected()`` check at the
+                    # top of the loop returns False, i.e. the SSE
+                    # stream is still flowing to the peer's TCP socket.
+                    # That is a strong-enough liveness proof: if the
+                    # client had hung, ``is_disconnected`` would catch
+                    # it and we'd break out instead of yielding.
+                    #
+                    # Refreshing here is critical for the producer-
+                    # idle-but-online case: a daemon registers as a
+                    # producer and then waits for sessions, doing zero
+                    # POSTs. Without this touch the sweeper would
+                    # evict it after ``LEASE_SECONDS`` even though the
+                    # SSE channel is healthy.
+                    signaling.touch(peer.peer_id)
                     yield {"event": "ping", "data": ""}
 
         finally:
