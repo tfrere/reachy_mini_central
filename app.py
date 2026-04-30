@@ -47,15 +47,36 @@ logger = logging.getLogger(__name__)
 # delivery) is younger than ``LEASE_SECONDS``. The sweeper task scans
 # every ``SWEEPER_INTERVAL_SECONDS`` and evicts any expired peer.
 #
-# The lease has to comfortably outlast the worst-case daemon status
-# tick gap (1 s today, plus any HF Space cold-start latency on a POST
-# round-trip) so a healthy daemon never gets falsely evicted. 45 s
-# is roughly 30x that worst case.
+# Sizing: ``LEASE_SECONDS`` MUST be at least ``2.5 *
+# RECOMMENDED_HEARTBEAT`` so a healthy daemon tolerates 2 consecutive
+# missed heartbeats (network blip, transient relay restart) without
+# false eviction. The daemon negotiates its actual heartbeat interval
+# from this lease via the ``welcome`` SSE message (see
+# ``recommended_heartbeat_interval_seconds`` below), so the only
+# parameter we need to keep stable is the lease itself.
+#
+# This Space (tfrere/reachy_mini_central) has ``sleep_time=None`` and
+# ``gcTimeout=48h``, so cold-start latency is not a concern; we can
+# size the lease tightly to minimise the staleness window observed by
+# remote clients (mobile/desktop too far for BLE).
 #
 # Tunable via env vars for local testing of failure paths without a
 # code change.
-LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "45"))
-SWEEPER_INTERVAL_SECONDS = float(os.getenv("REACHY_CENTRAL_SWEEPER_INTERVAL", "10"))
+LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "15"))
+SWEEPER_INTERVAL_SECONDS = float(os.getenv("REACHY_CENTRAL_SWEEPER_INTERVAL", "3"))
+
+
+def _recommended_heartbeat_interval() -> float:
+    """Return the heartbeat interval daemons should use, derived from
+    ``LEASE_SECONDS``.
+
+    Lease ÷ 3 gives daemons ~2 consecutive misses of headroom before
+    eviction (heartbeat at t=0,3,6 → last_seen=0; if next 3 fail, lease
+    expires at t=15 with one tick of margin). Daemons receive this in
+    the ``welcome`` frame and adjust their loop accordingly, so server
+    operators only ever need to tune ``LEASE_SECONDS``.
+    """
+    return max(1.0, LEASE_SECONDS / 3.0)
 
 
 @asynccontextmanager
@@ -709,8 +730,25 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
         # touching on outbound writes is unsound liveness anyway.
         # Inbound traffic (POST /send) is the only authoritative
         # signal, and the daemon's heartbeat will produce one within
-        # ``HEARTBEAT_INTERVAL_SECONDS``.
-        yield {"event": "message", "data": json.dumps({"type": "welcome", "peerId": peer.peer_id, "username": username})}
+        # ``recommended_heartbeat_interval_seconds`` (see below).
+        #
+        # ``lease_seconds`` and ``recommended_heartbeat_interval_seconds``
+        # let the daemon auto-tune its heartbeat loop so the only knob
+        # operators need to turn lives here on the server. Older daemon
+        # versions ignore unknown welcome fields, so this is fully
+        # backwards-compatible: they keep using their hard-coded default.
+        yield {
+            "event": "message",
+            "data": json.dumps(
+                {
+                    "type": "welcome",
+                    "peerId": peer.peer_id,
+                    "username": username,
+                    "lease_seconds": LEASE_SECONDS,
+                    "recommended_heartbeat_interval_seconds": _recommended_heartbeat_interval(),
+                }
+            ),
+        }
 
         # Send current producers list for listeners (filtered by owner)
         yield {"event": "message", "data": json.dumps({"type": "list", "producers": signaling.get_producers_list(username)})}
@@ -832,7 +870,12 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint.
+
+    Exposes the liveness parameters so external clients (and the daemon
+    welcome handshake) can introspect the active configuration without
+    redeploying.
+    """
     return {
         "status": "healthy",
         "peers": len([p for p in signaling.peers.values() if p.connected]),
@@ -840,6 +883,7 @@ async def health():
         "sessions": len(signaling.sessions),
         "lease_seconds": LEASE_SECONDS,
         "sweeper_interval_seconds": SWEEPER_INTERVAL_SECONDS,
+        "recommended_heartbeat_interval_seconds": _recommended_heartbeat_interval(),
     }
 
 
@@ -853,16 +897,33 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
 
     Response shape:
         {
+            "lease_seconds": 15,
             "robots": [
                 {
                     "peerId": "...",
                     "robotName": "reachy_mini",
                     "busy": true,
-                    "activeApp": "Hand Tracker Live App Demo"
+                    "activeApp": "Hand Tracker Live App Demo",
+                    "meta": {"name": "reachy_mini", "install_id": "abc123..."},
+                    "last_seen_age_seconds": 2.4
                 },
                 ...
             ]
         }
+
+    ``meta`` mirrors the producer metadata as registered via ``setPeerStatus``
+    (same shape as the SSE ``list`` message). It carries ``install_id`` -
+    the stable per-install key that mobile/desktop clients use to dedupe a
+    central listing against the same physical robot's BLE / loopback row.
+    Forwarded verbatim so future daemon-side fields (capabilities, version,
+    ...) appear without another central change.
+
+    ``last_seen_age_seconds`` is the wall-time gap since the producer last
+    sent inbound traffic (POST /send heartbeat). Clients can gate their UI
+    "reachable" state on ``age < lease_seconds * 0.6`` for a tighter
+    freshness check than the server-side sweeper window. ``lease_seconds``
+    is mirrored at the top level so clients don't need to query
+    ``/health`` separately.
     """
     username = await validate_hf_token(token)
     if not username:
@@ -870,6 +931,7 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
         )
 
+    now = time.monotonic()
     robots = []
     for pid, p in signaling.producers.items():
         if p.username != username:
@@ -883,7 +945,77 @@ async def robot_status(token: str = Depends(_resolve_hf_token)):
                 "robotName": p.meta.get("name"),
                 "busy": p.session_id is not None,
                 "activeApp": active_app,
+                "meta": p.meta,
+                "last_seen_age_seconds": round(now - p.last_seen, 2),
             }
         )
 
-    return {"robots": robots}
+    return {"lease_seconds": LEASE_SECONDS, "robots": robots}
+
+
+@app.get("/api/debug/peers")
+async def debug_peers(token: str = Depends(_resolve_hf_token)):
+    """Owner-filtered dump of all known peers for debugging.
+
+    Returns every peer (producers AND consumers) belonging to the caller,
+    not just registered producers. Use this when a robot does not show up
+    where expected: see whether the daemon's SSE channel is still open
+    (``connected=True``), how stale ``last_seen`` is, what role/meta is
+    registered, and whether a session is in progress.
+
+    This is more verbose than ``/api/robot-status`` (which only returns
+    registered producers and elides session/peer details). Same auth
+    rules and same owner-only filter, so it's safe to expose.
+
+    Response shape:
+        {
+            "lease_seconds": 15,
+            "sweeper_interval_seconds": 3,
+            "now": 1234.56,
+            "peers": [
+                {
+                    "peerId": "...",
+                    "role": "producer",
+                    "connected": true,
+                    "in_producers": true,
+                    "session_id": null,
+                    "partner_id": null,
+                    "meta": {...},
+                    "last_seen": 1230.12,
+                    "last_seen_age_seconds": 4.44
+                },
+                ...
+            ]
+        }
+    """
+    username = await validate_hf_token(token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+
+    now = time.monotonic()
+    peers = []
+    for pid, p in signaling.peers.items():
+        if p.username != username:
+            continue
+        peers.append(
+            {
+                "peerId": pid,
+                "role": p.role,
+                "connected": p.connected,
+                "in_producers": pid in signaling.producers,
+                "session_id": p.session_id,
+                "partner_id": p.partner_id,
+                "meta": p.meta,
+                "last_seen": round(p.last_seen, 2),
+                "last_seen_age_seconds": round(now - p.last_seen, 2),
+            }
+        )
+
+    return {
+        "lease_seconds": LEASE_SECONDS,
+        "sweeper_interval_seconds": SWEEPER_INTERVAL_SECONDS,
+        "now": round(now, 2),
+        "peers": peers,
+    }

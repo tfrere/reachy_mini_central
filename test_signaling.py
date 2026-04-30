@@ -25,6 +25,7 @@ from app import (
     LEASE_SECONDS,
     Peer,
     SignalingServer,
+    _recommended_heartbeat_interval,
 )
 
 
@@ -317,3 +318,31 @@ async def test_disconnect_peer_idempotent():
     await server.disconnect_peer(p.peer_id)
     # Second call must not raise on a missing peer.
     await server.disconnect_peer(p.peer_id)
+
+
+# ----------------------------------------------------------------------
+# Heartbeat / lease negotiation contract
+# ----------------------------------------------------------------------
+
+
+def test_recommended_heartbeat_is_a_third_of_the_lease():
+    """The daemon's heartbeat hint must always be small enough that
+    central sees ~3 successful inbound POSTs per lease window. Anything
+    larger and a single missed heartbeat puts a healthy daemon at the
+    edge of eviction.
+    """
+    assert _recommended_heartbeat_interval() == pytest.approx(LEASE_SECONDS / 3.0)
+
+
+def test_recommended_heartbeat_has_a_floor():
+    """Even with a pathologically small lease, we never recommend
+    sub-second heartbeats: that's a busy loop, not signaling.
+    """
+    import app as central_app
+
+    saved = central_app.LEASE_SECONDS
+    try:
+        central_app.LEASE_SECONDS = 0.5
+        assert central_app._recommended_heartbeat_interval() >= 1.0
+    finally:
+        central_app.LEASE_SECONDS = saved
