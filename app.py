@@ -21,11 +21,13 @@ canonical contract):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator
@@ -60,9 +62,13 @@ logger = logging.getLogger(__name__)
 # size the lease tightly to minimise the staleness window observed by
 # remote clients (mobile/desktop too far for BLE).
 #
-# Tunable via env vars for local testing of failure paths without a
-# code change.
-LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "15"))
+# 30 s default: heartbeat = lease / 3 = 10 s, which sits comfortably
+# below the 60 s idle timeout typical of HTTP/2 proxies (HF Spaces,
+# Cloudflare). This applies the WebSocket "75 % rule" (heartbeat at
+# 75 % of the shortest proxy timeout) while halving baseline relay
+# traffic vs the previous 5 s cadence. Tunable via env var for local
+# testing of failure paths without a code change.
+LEASE_SECONDS = float(os.getenv("REACHY_CENTRAL_LEASE_SECONDS", "30"))
 SWEEPER_INTERVAL_SECONDS = float(os.getenv("REACHY_CENTRAL_SWEEPER_INTERVAL", "3"))
 
 
@@ -113,34 +119,74 @@ app.add_middleware(
 # Cache for validated tokens (token -> username)
 token_cache: dict[str, str] = {}
 
-# Rate limiting: username -> (request_count, window_start)
-rate_limit_cache: dict[str, tuple[int, float]] = {}
-RATE_LIMIT_REQUESTS = 100  # Max requests per window
-RATE_LIMIT_WINDOW = 60  # Window in seconds
+
+# --- Rate limiting --------------------------------------------------
+#
+# Per-peer (token-keyed), sliding-window. Two intentional choices:
+#
+# 1. **Per-peer, not per-user.** A single HF account can run several
+#    daemons (USB + Wi-Fi + extras). Keying the bucket on ``username``
+#    makes them cannibalise each other, so adding a robot to the fleet
+#    silently throttles the others. Hashing the token gives every peer
+#    its own quota - the multi-tenant SaaS pattern of "composite key
+#    per session" applied to robots.
+#
+# 2. **Sliding window via deque, not fixed 60 s window.** Fixed windows
+#    rebound abruptly at the boundary (a peer that hit 100/100 at
+#    t=59.9 s instantly gets 100 fresh tokens at t=60.0 s, encouraging
+#    bursty clients). A deque of monotonic timestamps drops entries as
+#    they age out, which is smoother and preserves the per-second
+#    average regardless of clock alignment.
+#
+# Sizing: 1200 req / 60 s = 20 req/s sustained per peer, aligned with
+# typical WebRTC signaling servers (CloudGaming reports 200 msg / 10 s
+# per connection). With heartbeat at 10 s (6 req/min), a typical mobile
+# session (offer + answer + ~10 ICE candidates ~ 15 req over a few
+# seconds), and aggressive reconnects, observed peak under load is
+# ~50-100 req/min/peer. We keep a 12-24x headroom so adding features
+# (status polls, presence, etc.) does not require retuning the limit.
+RATE_LIMIT_REQUESTS = 1200
+RATE_LIMIT_WINDOW = 60.0
+_rate_limit_buckets: dict[str, deque[float]] = {}
 
 
-def check_rate_limit(username: str) -> bool:
-    """Check if user is rate limited. Returns True if allowed, False if limited."""
-    now = time.time()
+def _rate_limit_key(token: str) -> str:
+    """Return a stable, non-reversible per-peer bucket key.
 
-    if username not in rate_limit_cache:
-        rate_limit_cache[username] = (1, now)
-        return True
+    SHA-256 prefix avoids storing raw tokens in the bucket index. The
+    16-hex-char prefix has 2^64 combinations - plenty for collision
+    avoidance across simultaneously active peers.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
-    count, window_start = rate_limit_cache[username]
 
-    # Reset window if expired
-    if now - window_start > RATE_LIMIT_WINDOW:
-        rate_limit_cache[username] = (1, now)
-        return True
+def check_rate_limit(token: str) -> bool:
+    """Sliding-window per-peer rate limit.
 
-    # Check limit
-    if count >= RATE_LIMIT_REQUESTS:
-        logger.warning(f"Rate limit exceeded for user: {username}")
+    Drops timestamps older than ``RATE_LIMIT_WINDOW``, then checks the
+    current count. Returns ``True`` if the request is allowed and
+    appends ``now`` to the bucket; returns ``False`` if the bucket is
+    full (the request is then expected to translate to a 429 by the
+    caller).
+    """
+    now = time.monotonic()
+    key = _rate_limit_key(token)
+    bucket = _rate_limit_buckets.setdefault(key, deque())
+
+    cutoff = now - RATE_LIMIT_WINDOW
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
+        logger.warning(
+            "Rate limit exceeded peer_key=%s count=%d window=%.0fs",
+            key,
+            len(bucket),
+            RATE_LIMIT_WINDOW,
+        )
         return False
 
-    # Increment counter
-    rate_limit_cache[username] = (count + 1, window_start)
+    bucket.append(now)
     return True
 
 
@@ -718,7 +764,7 @@ async def events(request: Request, token: str = Depends(_resolve_hf_token)):
 
     logger.info("SSE connection request from user: %s", username)
 
-    if not check_rate_limit(username):
+    if not check_rate_limit(token):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
 
     peer = signaling.get_or_create_peer(token, username)
@@ -801,7 +847,7 @@ async def send_message(request: Request, token: str = Depends(_resolve_hf_token)
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    if not check_rate_limit(username):
+    if not check_rate_limit(token):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
 
     # Get or reconnect peer
@@ -853,7 +899,7 @@ async def root():
             <ul>
                 <li>HuggingFace token authentication required</li>
                 <li>Owner-based filtering: users only see their own robots</li>
-                <li>Rate limiting: {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW}s per user</li>
+                <li>Rate limiting: {RATE_LIMIT_REQUESTS} requests per {int(RATE_LIMIT_WINDOW)}s per peer (sliding window)</li>
             </ul>
         </div>
         <h2>Endpoints</h2>

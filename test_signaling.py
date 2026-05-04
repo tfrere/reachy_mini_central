@@ -18,14 +18,20 @@ Run with::
 from __future__ import annotations
 
 import time
+from collections import deque
 
 import pytest
 
 from app import (
     LEASE_SECONDS,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW,
     Peer,
     SignalingServer,
+    _rate_limit_buckets,
+    _rate_limit_key,
     _recommended_heartbeat_interval,
+    check_rate_limit,
 )
 
 
@@ -346,3 +352,104 @@ def test_recommended_heartbeat_has_a_floor():
         assert central_app._recommended_heartbeat_interval() >= 1.0
     finally:
         central_app.LEASE_SECONDS = saved
+
+
+# ----------------------------------------------------------------------
+# Rate limiting (per-peer, sliding window)
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def _clean_rate_limit_buckets():
+    """Snapshot and restore the global bucket store around a test.
+
+    Tests in this section exercise process-wide state, so we isolate
+    them from each other and from anything that ran earlier in the
+    session.
+    """
+    snapshot = {k: v.copy() for k, v in _rate_limit_buckets.items()}
+    _rate_limit_buckets.clear()
+    try:
+        yield
+    finally:
+        _rate_limit_buckets.clear()
+        _rate_limit_buckets.update(snapshot)
+
+
+def test_rate_limit_key_is_stable_and_non_reversible(_clean_rate_limit_buckets):
+    """Same token -> same bucket key (deterministic), different tokens
+    -> different keys (no collisions at this scale).
+    """
+    a = _rate_limit_key("token-alice-1")
+    b = _rate_limit_key("token-alice-1")
+    c = _rate_limit_key("token-alice-2")
+    assert a == b
+    assert a != c
+    assert "token" not in a, "raw token must not be embedded in the key"
+    assert len(a) == 16
+
+
+def test_rate_limit_allows_requests_under_threshold(_clean_rate_limit_buckets):
+    token = "tok-under"
+    for _ in range(10):
+        assert check_rate_limit(token) is True
+
+
+def test_rate_limit_blocks_requests_over_threshold(_clean_rate_limit_buckets):
+    """Once the window is full, the next call returns False - the caller
+    is expected to translate that into a 429.
+    """
+    token = "tok-over"
+    for _ in range(RATE_LIMIT_REQUESTS):
+        assert check_rate_limit(token) is True
+    assert check_rate_limit(token) is False
+
+
+def test_rate_limit_isolates_peers_under_same_user(_clean_rate_limit_buckets):
+    """Two daemons under the same HF account (different tokens) get
+    independent buckets. This is the regression test for the original
+    incident: heartbeat traffic from one robot must not starve the
+    other.
+    """
+    saturated_token = "tok-busy"
+    quiet_token = "tok-quiet"
+    for _ in range(RATE_LIMIT_REQUESTS):
+        assert check_rate_limit(saturated_token) is True
+    assert check_rate_limit(saturated_token) is False
+    assert check_rate_limit(quiet_token) is True
+
+
+def test_rate_limit_sliding_window_drops_aged_timestamps(
+    _clean_rate_limit_buckets,
+):
+    """A timestamp older than the window must roll out without waiting
+    for a counter reset. The deque-based implementation enforces this
+    naturally; this test guards against a regression to a fixed-window
+    counter.
+    """
+    token = "tok-slide"
+    bucket = _rate_limit_buckets.setdefault(_rate_limit_key(token), deque())
+    bucket.extend([time.monotonic() - RATE_LIMIT_WINDOW - 1.0] * RATE_LIMIT_REQUESTS)
+    assert len(bucket) == RATE_LIMIT_REQUESTS
+
+    assert check_rate_limit(token) is True
+    assert len(bucket) == 1, "stale timestamps must be evicted before the new one is appended"
+
+
+def test_rate_limit_records_each_allowed_request(_clean_rate_limit_buckets):
+    """The bucket length must equal the number of allowed calls so far,
+    so capacity planning is straightforward.
+    """
+    token = "tok-count"
+    for i in range(1, 6):
+        assert check_rate_limit(token) is True
+        assert len(_rate_limit_buckets[_rate_limit_key(token)]) == i
+
+
+def test_rate_limit_default_capacity_matches_industry_baseline():
+    """Sanity bound on the configured capacity: at least 600 req/min
+    (~10 req/s) per peer so heartbeats + signaling + reconnects fit
+    comfortably without retuning.
+    """
+    assert RATE_LIMIT_REQUESTS >= 600
+    assert RATE_LIMIT_WINDOW <= 60.0
