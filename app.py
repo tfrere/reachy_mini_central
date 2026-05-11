@@ -548,12 +548,35 @@ class SignalingServer:
             await self.disconnect_peer(old_id)
 
     def get_producers_list(self, username: str) -> list:
-        """Get list of producers owned by the given user."""
-        return [
-            {"id": p.peer_id, "meta": p.meta}
-            for p in self.producers.values()
-            if p.connected and p.username == username
-        ]
+        """Get list of producers owned by the given user.
+
+        Mirrors the shape of ``/api/robot-status`` so a listener that
+        connects mid-session sees the correct ``busy``/``activeApp``
+        on its initial ``list`` SSE frame, without needing a follow-up
+        REST call. Subsequent transitions are pushed via
+        ``sessionStateChanged`` (see ``handle_start_session`` and
+        ``handle_end_session``).
+
+        ``activeApp`` defaults to None when the consumer never
+        advertised a ``meta.name`` (legacy pre-feature clients) or
+        when the producer is currently free.
+        """
+        out: list[dict] = []
+        for p in self.producers.values():
+            if not (p.connected and p.username == username):
+                continue
+            active_app = None
+            if p.session_id and p.partner_id and p.partner_id in self.peers:
+                active_app = self.peers[p.partner_id].meta.get("name")
+            out.append(
+                {
+                    "id": p.peer_id,
+                    "meta": p.meta,
+                    "busy": p.session_id is not None,
+                    "activeApp": active_app,
+                }
+            )
+        return out
 
     async def handle_start_session(self, peer: Peer, message: dict) -> dict:
         """Handle session start request."""
@@ -603,6 +626,27 @@ class SignalingServer:
             "sessionId": session_id
         })
 
+        # Broadcast busy transition to same-owner listeners. Lets a
+        # second device of the user (mobile + desktop on the same HF
+        # account) flip its on-screen "free" affordance to a "busy"
+        # one within the round-trip rather than waiting on the
+        # 30 s ``/api/robot-status`` poll. We deliberately exclude
+        # the consumer that just acquired the slot (it already knows
+        # via ``sessionStarted``) and forward the consumer's
+        # ``meta.name`` as ``activeApp`` so listener UIs can read
+        # "in use - {app}" without a follow-up REST call.
+        await self.broadcast_to_listeners(
+            {
+                "type": "sessionStateChanged",
+                "peerId": producer_id,
+                "busy": True,
+                "activeApp": peer.meta.get("name"),
+                "meta": producer.meta,
+            },
+            exclude_id=peer.peer_id,
+            owner_username=producer.username,
+        )
+
         logger.info(f"Session started: {session_id}")
         return {"type": "sessionStarted", "peerId": producer_id, "sessionId": session_id}
 
@@ -640,6 +684,11 @@ class SignalingServer:
             return
 
         producer_id, consumer_id = self.sessions[session_id]
+        # Snapshot the producer BEFORE we clear the session, so the
+        # post-cleanup broadcast still carries its meta even when
+        # the producer has already been removed from ``producers``
+        # (e.g. ``disconnect_peer`` calls us right before the del).
+        producer = self.peers.get(producer_id)
 
         msg: dict = {"type": "endSession", "sessionId": session_id}
         if reason is not None:
@@ -653,6 +702,32 @@ class SignalingServer:
                 await self.send_to_peer(peer_id, msg)
 
         del self.sessions[session_id]
+
+        # Broadcast free transition to same-owner listeners, mirror
+        # of the start-session broadcast. We resolve the owner from
+        # whichever side of the session is still in ``peers`` so the
+        # broadcast keeps working even when the producer (or
+        # consumer) just disconnected. If both are gone we skip the
+        # emit rather than fall back to a global broadcast: a
+        # missing ``owner_username`` would leak the event to every
+        # listener, regardless of HF user.
+        owner_username: Optional[str] = None
+        if producer is not None:
+            owner_username = producer.username
+        elif consumer_id in self.peers:
+            owner_username = self.peers[consumer_id].username
+        if owner_username is not None:
+            await self.broadcast_to_listeners(
+                {
+                    "type": "sessionStateChanged",
+                    "peerId": producer_id,
+                    "busy": False,
+                    "activeApp": None,
+                    "meta": producer.meta if producer is not None else {},
+                },
+                owner_username=owner_username,
+            )
+
         logger.info(f"Session ended: {session_id} (reason={reason!r})")
 
     async def handle_message(self, peer: Peer, message: dict) -> Optional[dict]:
